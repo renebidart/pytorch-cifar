@@ -13,3 +13,8 @@ from .preact_resnet import *
 from .mobilenet import *
 from .mobilenetv2 import *
 from .efficientnet import *
+from .wsresnet import *
+from .wsxception import *
+from .wsmobilenetv2 import *
+from .albert2d import *
+

@@ -86,12 +86,19 @@ class ResNet(nn.Module):
         return nn.Sequential(*layers)
 
     def forward(self, x):
+#         print('0', x.size())
         out = F.relu(self.bn1(self.conv1(x)))
+#         print('0', out.size())
         out = self.layer1(out)
+#         print('1', out.size())
         out = self.layer2(out)
+#         print('2', out.size())
         out = self.layer3(out)
+#         print('3', out.size())
         out = self.layer4(out)
+#         print('4', out.size())
         out = F.avg_pool2d(out, 4)
+#         print('pool', out.size())
         out = out.view(out.size(0), -1)
         out = self.linear(out)
         return out
