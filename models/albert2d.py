@@ -10,6 +10,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.init import xavier_uniform_, constant_
+
 
 
 
@@ -17,50 +19,48 @@ def gelu(x):
     "Implementation of the gelu activation function by Hugging Face"
     return x * 0.5 * (1.0 + torch.erf(x / math.sqrt(2.0)))
 
-# !!!!!!!!!  Possibly extend this to 2d directly instead
-# class LayerNorm(nn.Module):
-#     "A layernorm module in the TF style (epsilon inside the square root)."
-#     def __init__(self, n_hidden, variance_epsilon=1e-12):
-#         super().__init__()
-#         self.gamma = nn.Parameter(torch.ones(n_hidden))
-#         self.beta  = nn.Parameter(torch.zeros(n_hidden))
-#         self.variance_epsilon = variance_epsilon
-
-#     def forward(self, x):
-#         u = x.mean(-1, keepdim=True)
-#         s = (x - u).pow(2).mean(-1, keepdim=True)
-#         x = (x - u) / torch.sqrt(s + self.variance_epsilon)
-#         return self.gamma * x + self.beta
-
-
-class AbsPositionEmbedding(nn.Module):
-    "Position embeddings"
-    def __init__(self, n_hidden, learned=False):
+class LayerNormCustom(nn.Module):
+    "A layernorm module in the TF style (epsilon inside the square root)."
+    def __init__(self, n_hidden, variance_epsilon=1e-12):
         super().__init__()
-        # Original BERT Embedding
-        # self.tok_embed = nn.Embedding(cfg.vocab_size, cfg.hidden) # token embedding
+        self.gamma = nn.Parameter(torch.ones(n_hidden))
+        self.beta  = nn.Parameter(torch.zeros(n_hidden))
+        self.variance_epsilon = variance_epsilon
 
-        # factorized embedding
-        self.tok_embed1 = nn.Embedding(cfg.vocab_size, cfg.embedding)
-        self.tok_embed2 = nn.Linear(cfg.embedding, cfg.hidden)
+    def forward(self, x):
+        u = x.mean(1, keepdim=True)
+        s = (x - u).pow(2).mean(-1, keepdim=True)
+        x = (x - u) / torch.sqrt(s + self.variance_epsilon)
+        return self.gamma * x + self.beta
 
-        self.pos_embed = nn.Embedding(cfg.max_len, cfg.hidden) # position embedding
-        self.seg_embed = nn.Embedding(cfg.n_segments, cfg.hidden) # segment(token type) embedding
 
-        self.norm = LayerNorm(cfg)
-        # self.drop = nn.Dropout(cfg.p_drop_hidden)
+class PositionEmbedding(nn.Module):
+    "Position embeddings"
+    def __init__(self, n_hidden, H, W, drop=.1):
+        super().__init__()
+        self.pos_embed_h = nn.Embedding(H, n_hidden) # position embedding
+        self.pos_embed_w = nn.Embedding(W, n_hidden) # position embedding
+        self.embedding = nn.Conv2d(n_hidden, n_hidden, kernel_size=1, bias=True)
+        # !!!! ???? maybe switch to good norm
+        self.norm = nn.BatchNorm2d(n_hidden)
+        self.drop = nn.Dropout(drop)
 
-    def forward(self, x, seg):
-        seq_len = x.size(1)
-        pos = torch.arange(seq_len, dtype=torch.long, device=x.device)
-        pos = pos.unsqueeze(0).expand_as(x) # (S,) -> (B, S)
-
-        # factorized embedding
-        e = self.tok_embed1(x)
-        e = self.tok_embed2(e)
-        e = e + self.pos_embed(pos) + self.seg_embed(seg)
-        #return self.drop(self.norm(e))
-        return self.norm(e)
+    def forward(self, x):
+        BS, D, H, W = x.size()
+        seq_len = H
+        pos_h = torch.arange(H, dtype=torch.long, device=x.device)
+        pos_w = torch.arange(W, dtype=torch.long, device=x.device)
+        # H -> [BS, H, W]
+        pos_h = pos_h.unsqueeze(0).unsqueeze(-1).repeat(BS, 1, W)
+        pos_w = pos_w.unsqueeze(0).unsqueeze(0).repeat(BS, H, 1)
+#         print('pos_h[0, 0, :]', pos_h[0, 0, :])
+#         print('pos_w[0, 0, :]', pos_w[0, 0, :])
+#         print('pos_w[0, :, 2]', pos_w[0, :, 2])
+        # not sure if it should be residual like this:
+        pos_h = self.pos_embed_h(pos_h).permute(0, 3, 1, 2).contiguous()
+        pos_w =  self.pos_embed_w(pos_w).permute(0, 3, 1, 2).contiguous()
+        x = x + self.embedding(x) + pos_h + pos_w
+        return self.drop(self.norm(x))
 
 ## Copy paste from https://github.com/leaderj1001/Stand-Alone-Self-Attention/blob/a983f0f643632b1f2b7b8b27693182f22e9e574c/attention.py#L9
 ## !!!!!! ???? Check if this implementation is right, or try something different like non-local block from
@@ -126,14 +126,14 @@ class MultiheadSelfAttention2D(nn.Module):
         self.need_weights = need_weights
         assert self.head_dim * num_heads == self.embed_dim, "embed_dim must be divisible by num_heads"
  
-        self.in_proj_weight = Parameter(torch.empty(3 * embed_dim, embed_dim))
+        self.in_proj_weight = nn.Parameter(torch.empty(3 * embed_dim, embed_dim))
         self.register_parameter('q_proj_weight', None)
         self.register_parameter('k_proj_weight', None)
         self.register_parameter('v_proj_weight', None)
         if bias:
-            self.in_proj_bias = Parameter(torch.empty(3 * embed_dim))
+            self.in_proj_bias = nn.Parameter(torch.empty(3 * embed_dim))
         
-        self.out_proj = Linear(embed_dim, embed_dim, bias=bias)
+        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self._reset_parameters()
         
     def _reset_parameters(self):
@@ -174,6 +174,8 @@ class MultiheadSelfAttention2D(nn.Module):
                                     num_heads=self.num_heads,
                                     in_proj_weight = self.in_proj_weight, 
                                     in_proj_bias = self.in_proj_bias,
+                                    bias_k=None,  
+                                    bias_v=None,
                                     add_zero_attn=False, # ??? don't understand
                                     dropout_p=self.dropout, 
                                     out_proj_weight=self.out_proj.weight,
@@ -187,7 +189,8 @@ class MultiheadSelfAttention2D(nn.Module):
         out = out.permute(1, 2, 0).contiguous()
         out = out.view(BS, D, H, W).contiguous()
         # !!! will have to reshape attn_weights into a useable format
-        return out, attn_weights
+        if self.need_weights: return out, attn_weights
+        else: return out
     
         
 class PositionWiseFeedForward(nn.Module):
@@ -236,6 +239,9 @@ class ALBERT(nn.Module):
         if norm=='batch':
             self.norm1 = torch.nn.BatchNorm2d(num_features=self.n_hidden)
             self.norm2 = torch.nn.BatchNorm2d(num_features=self.n_hidden)
+        elif norm=='layer_albert':
+            self.norm1 = LayerNormCustom(self.n_hidden)
+            self.norm2 = LayerNormCustom(self.n_hidden)
         elif norm=='layer':
             self.norm1 = torch.nn.LayerNorm([self.n_hidden, 16, 16], eps=1e-05, elementwise_affine=True)
             self.norm2 = torch.nn.LayerNorm([self.n_hidden, 16, 16], eps=1e-05, elementwise_affine=True)
@@ -251,19 +257,21 @@ class ALBERT(nn.Module):
         elif norm=='weight':
             self.norm1 = torch.nn.utils.weight_norm()
             self.norm2 = torch.nn.utils.weight_norm()
-        
-        # maybe remove or change to the above norm method:
-#         self.embedding_norm = nn.BatchNorm2d(64)
-        
+                
+                
         if self.cifar:
             self.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
             self.bn1 = nn.BatchNorm2d(64)
             self.conv2 = nn.Conv2d(64, self.n_hidden, kernel_size=5, stride=2, padding=2, bias=False)
             self.bn2 = nn.BatchNorm2d(self.n_hidden)
             
+        
+        self.embed = PositionEmbedding(self.n_hidden, 16, 16)
+
+            
         if self.spatial == 'conv':
             self.spatial_layer = nn.Conv2d(self.n_hidden, self.n_hidden, kernel_size=7, stride=1, padding=3, bias=True)
-        if self.spatial == 'attention':
+        if self.spatial == 'attn':
             self.spatial_layer = MultiheadSelfAttention2D(self.n_hidden, num_heads=4, dropout=0.1, bias=True, need_weights=False)
 #         elif self.attention_type == 'attention_conv':
 #             self.attn = AttentionConv(self.n_hidden, self.n_hidden, kernel_size=5, stride=1, padding=0, groups=1, bias=False)
@@ -274,9 +282,10 @@ class ALBERT(nn.Module):
         self.pool = nn.AdaptiveAvgPool2d(1)
             
     def forward(self, x):
-#         x = self.embedding_norm(self.embedding(x))
         x = gelu(self.bn1(self.conv1(x)))
         x = gelu(self.bn2(self.conv2(x)))
+        # weird spot for position embedding, but I image better to put on downsampled one
+        x = self.embed(x) 
         for _ in range(self.n_layers):
 #             x = self.attn(x, mask)
             x = self.spatial_layer(x)
